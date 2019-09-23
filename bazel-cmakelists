@@ -14,6 +14,7 @@
 # DON'T USE CMAKE TO BUILD THE PROJECT. It is not tested and likely to fail.
 
 import argparse
+from collections import namedtuple
 from os import path
 import os
 import re
@@ -23,6 +24,76 @@ import sys
 
 EXTERNAL_PATTERN = re.compile("^@(.*)\\/\\/")
 SOURCE_EXTENSION = set([".h", ".hpp", ".hh", ".hxx", ".c", ".cc", ".cpp", ".cxx"])
+
+PATCH_CATEGORIES = set(['source', 'generated', 'include', 'define'])
+PatchRule = namedtuple('PatchRule', ['action', 'regex', 'subst'])
+
+def ParsePatch(path):
+  patch = {}
+  for cat in PATCH_CATEGORIES:
+    patch[cat] = []
+  with open(path) as patchfile:
+    for i, line in enumerate(patchfile, 1):
+      line = line.rstrip('\n').lstrip()
+      if line.startswith('#'):
+        continue
+      if not line.strip():
+        continue
+      first_sep_match = re.search(r'[^\w\s]', line)
+      sep = line[first_sep_match.start()]
+      parts = line.split(sep)
+      (category, action), params = parts[:2], parts[2:]
+      if category not in patch:
+        sys.stderr.write("Unknown category {!r} on line {}".format(category, i))
+        continue
+      if action not in 'ads':
+        sys.stderr.write("Unknown action {!r} on line {}".format(action, i))
+      try:
+        if action == 'd':
+          regex, = params
+          re.compile(regex)
+          patch[category].append(PatchRule(action, regex, None))
+        elif action == 's':
+          regex, subst = params
+          re.sub(regex, subst, '')
+          patch[category].append(PatchRule(action, regex, subst))
+        elif action == 'a':
+          subst, = params
+          patch[category].append(PatchRule(action, None, subst))
+      except re.error as e:
+        sys.stderr.write("Bad regex on line {}: {}".format(i, e))
+        continue
+      except ValueError as e:
+        sys.stderr.write("Param count mismatch on line {}: {}".format(i, e))
+        continue
+  return patch
+
+def ApplyPatch(patch, category, items):
+  if not patch:
+    return items
+  new_items = []
+  rules = patch[category]
+  if not rules:
+    return items
+  for item in items:
+    new_item = item
+    for rule in rules:
+      if rule.action == 'd' and re.match(rule.regex, item):
+        new_item = None
+        break
+      if rule.action == 's':
+        new_item = re.sub(rule.regex, rule.subst, item)
+    if new_item is not None:
+      new_items.append(new_item)
+      if new_item != item:
+        sys.stderr.write('Patch:{}: {!r} -> {!r}\n'.format(category, item, new_item))
+    else:
+      sys.stderr.write('Patch:{}: {!r} deleted\n'.format(category, item))
+  for rule in rules:
+    if rule.action == 'a':
+      new_items.append(rule.subst)
+      sys.stderr.write('Patch:{}: {!r} added\n'.format(category, rule.subst))
+  return new_items
 
 def QueryTargets():
   return ' union '.join(FLAGS.targets)
@@ -138,6 +209,9 @@ def ExtractCopts():
   return set(copts)
 
 def GenerateCMakeList():
+  patch = {}
+  if FLAGS.patch:
+    patch = ParsePatch(FLAGS.patch)
   if not FLAGS.skip_build:
     bazel_args = ['build']
     bazel_args.extend(FLAGS.targets)
@@ -156,6 +230,10 @@ def GenerateCMakeList():
       includes.add(opt[2:])
     elif opt.startswith("-D"):
       defines.add(opt[2:])
+  sources = ApplyPatch(patch, 'source', sources)
+  generated = ApplyPatch(patch, 'generated', generated)
+  includes = ApplyPatch(patch, 'include', includes)
+  defines = ApplyPatch(patch, 'define', defines)
 
   output = FLAGS.output
   if FLAGS.mac_debug:
@@ -213,6 +291,7 @@ if __name__ == "__main__":
   parser.add_argument('--output', default="CMakeLists.txt")
   parser.add_argument('--bazel', default='bazel', help='Bazel executable')
   parser.add_argument('--std', default='c++14', help='C++ standard')
+  parser.add_argument('--patch', help='Patch rules file')
   parser.add_argument('bazel_args', nargs=argparse.REMAINDER)
   FLAGS = parser.parse_args()
 
